@@ -278,7 +278,7 @@ app.post('/api/admin/users/toggle', requireAdmin, (req, res) => {
     const cleanUser = String(username || '').trim().toLowerCase();
 
     if (cleanUser === 'c0d3r' || (users[cleanUser] && users[cleanUser].role === 'owner')) {
-        return res.status(400).json({ success: false, message: 'Нельзя заблокировать аккаунт главного Овнера!' });
+        return res.status(400).json({ success: false, message: 'Нельзя заблокировать главный аккаунт!' });
     }
 
     const user = users[cleanUser];
@@ -342,7 +342,7 @@ app.post('/api/admin/users/delete', requireAdmin, (req, res) => {
     const cleanUser = String(username || '').trim().toLowerCase();
 
     if (cleanUser === 'c0d3r' || (users[cleanUser] && users[cleanUser].role === 'owner')) {
-        return res.status(400).json({ success: false, message: 'Нельзя удалить аккаунт главного Овнера!' });
+        return res.status(400).json({ success: false, message: 'Нельзя удалить главный аккаунт!' });
     }
 
     if (!users[cleanUser]) {
@@ -500,7 +500,7 @@ app.get(['/', '/index.html', '/admin'], (req, res) => {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Heavy Rust • Панель Овнера и Античита</title>
+    <title>Heavy Rust • Панель управления и Античит</title>
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
     <style>
         :root {
@@ -569,11 +569,11 @@ app.get(['/', '/index.html', '/admin'], (req, res) => {
         <!-- Auth Login Screen (if not logged in) -->
         <div id="loginScreen" class="modal-overlay" style="display: none;">
             <div class="modal-card">
-                <h2>👑 Вход в Панель Овнера</h2>
-                <p style="color: var(--text-muted); font-size: 14px;">Для управления пользователями и защитой введите данные Овнера:</p>
+                <h2>Вход в панель</h2>
+                <p style="color: var(--text-muted); font-size: 14px;">Введите данные для доступа к панели управления:</p>
                 <div class="form-group">
-                    <label>Логин администратора</label>
-                    <input type="text" id="adminLoginUser" class="form-control" placeholder="c0d3r" value="c0d3r">
+                    <label>Логин</label>
+                    <input type="text" id="adminLoginUser" class="form-control" placeholder="Логин">
                 </div>
                 <div class="form-group">
                     <label>Пароль</label>
@@ -591,7 +591,7 @@ app.get(['/', '/index.html', '/admin'], (req, res) => {
                 <p style="color: var(--text-muted); font-size: 13px; margin-top: 4px;">Центральный сервер аутентификации, базы игроков и античита</p>
             </div>
             <div class="user-badge">
-                <span class="role-tag">👑 ОВНЕР: <span id="currentAdminName">c0d3r</span></span>
+                <span class="role-tag">🛡️ Администратор: <span id="currentAdminName">Admin</span></span>
                 <button class="btn-secondary" onclick="openProfileModal()">⚙️ Мой аккаунт</button>
                 <button class="btn-logout" onclick="logoutAdmin()">Выйти</button>
             </div>
@@ -669,11 +669,11 @@ app.get(['/', '/index.html', '/admin'], (req, res) => {
     <!-- PROFILE SETTINGS MODAL -->
     <div id="profileModal" class="modal-overlay" style="display: none;">
         <div class="modal-card">
-            <h2>⚙️ Настройки аккаунта Овнера</h2>
+            <h2>⚙️ Настройки аккаунта</h2>
             <p style="color: var(--text-muted); font-size: 13px;">Измените логин или пароль для входа в панель:</p>
             <div class="form-group">
                 <label>Ваш логин</label>
-                <input type="text" id="profileUser" class="form-control" placeholder="c0d3r">
+                <input type="text" id="profileUser" class="form-control" placeholder="Логин">
             </div>
             <div class="form-group">
                 <label>Новый пароль (оставьте пустым если не хотите менять)</label>
@@ -768,7 +768,7 @@ app.get(['/', '/index.html', '/admin'], (req, res) => {
                     loadUsers();
                     loadOnline();
                 } else {
-                    err.innerText = data.message || 'Требуются права Овнера или Администратора!';
+                    err.innerText = data.message || 'Требуются права Администратора!';
                     err.style.display = 'block';
                 }
             } catch (e) {
@@ -823,7 +823,7 @@ app.get(['/', '/index.html', '/admin'], (req, res) => {
             tbody.innerHTML = filtered.map(u => \`
                 <tr>
                     <td style="font-weight: 700; color: #fff;">\${escapeHtml(u.username)}</td>
-                    <td><span class="role-tag" style="\${u.role === 'owner' ? '' : 'background: rgba(0,229,255,0.1); color: var(--cyan-neon); border-color: rgba(0,229,255,0.3);'}">\${u.role.toUpperCase()}</span></td>
+                    <td><span class="role-tag" style="\${u.role === 'owner' ? '' : 'background: rgba(0,229,255,0.1); color: var(--cyan-neon); border-color: rgba(0,229,255,0.3);'}">\${u.role === 'owner' ? 'ADMIN' : u.role.toUpperCase()}</span></td>
                     <td><span class="badge \${u.active ? 'badge-active' : 'badge-blocked'}"><span class="pulse-dot"></span> \${u.active ? 'АКТИВЕН' : 'ЗАБЛОКИРОВАН'}</span></td>
                     <td>
                         <span class="mono" style="font-size: 11px; color: var(--text-muted);">\${u.hwid ? u.hwid : 'Не привязан'}</span>
@@ -836,7 +836,7 @@ app.get(['/', '/index.html', '/admin'], (req, res) => {
                                 <button class="btn-secondary" onclick="toggleUser('\${escapeHtml(u.username)}')">\${u.active ? 'Заблокировать' : 'Разблокировать'}</button>
                                 <button class="btn-secondary" onclick="openResetPassModal('\${escapeHtml(u.username)}')">Пароль</button>
                                 <button class="btn-danger" onclick="deleteUser('\${escapeHtml(u.username)}')">Удалить</button>
-                            \` : '<span style="color: var(--gold); font-size: 12px; font-weight: 600;">Главный Овнер</span>'}
+                            \` : '<span style="color: var(--gold); font-size: 12px; font-weight: 600;">Главный Администратор</span>'}
                         </div>
                     </td>
                 </tr>
