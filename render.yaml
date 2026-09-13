@@ -1,0 +1,9 @@
+﻿services:
+  - type: web
+    name: heavyrust-auth
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    autoDeploy: true
+    healthCheckPath: /api/players
