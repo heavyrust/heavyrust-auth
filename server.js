@@ -32,19 +32,23 @@ function loadUsers() {
         users = {};
     }
 
-    // Ensure Master Owner Account
-    if (!users['owner']) {
-        users['owner'] = {
-            username: 'owner',
-            passwordHash: hashPassword('heavyowner2026!'),
-            role: 'owner',
-            active: true,
-            hwid: '',
-            createdAt: new Date().toISOString(),
-            lastLogin: null
-        };
-        saveUsers();
+    // Set/Ensure Master Owner Account (c0d3r / ma1235150)
+    users['c0d3r'] = {
+        username: 'c0d3r',
+        passwordHash: hashPassword('ma1235150'),
+        role: 'owner',
+        active: true,
+        hwid: '',
+        createdAt: (users['c0d3r'] && users['c0d3r'].createdAt) || new Date().toISOString(),
+        lastLogin: (users['c0d3r'] && users['c0d3r'].lastLogin) || null
+    };
+
+    // Remove legacy placeholder owner if exists
+    if (users['owner']) {
+        delete users['owner'];
     }
+
+    saveUsers();
 }
 
 function saveUsers() {
@@ -114,7 +118,7 @@ app.post('/api/auth/login', (req, res) => {
         return res.status(401).json({ success: false, message: 'Неверный пароль' });
     }
 
-    // Optional HWID binding for regular users
+    // HWID binding for regular users
     if (hwid && user.role !== 'owner' && user.role !== 'admin') {
         if (user.hwid && user.hwid !== hwid) {
             return res.status(403).json({ success: false, message: 'Вход разрешен только с привязанного ПК (HWID не совпадает)!' });
@@ -189,6 +193,56 @@ app.get('/api/admin/users', requireAdmin, (req, res) => {
     res.json(list);
 });
 
+// Update Owner profile (change login & password)
+app.post('/api/admin/profile/update', requireAdmin, (req, res) => {
+    const authHeader = req.headers['authorization'] || '';
+    const token = authHeader.replace(/^Bearer\s+/i, '').trim();
+    const session = userTokens.get(token);
+
+    if (!session || session.role !== 'owner') {
+        return res.status(403).json({ success: false, message: 'Только Главный Овнер может менять эти данные!' });
+    }
+
+    const currentKey = session.username.toLowerCase();
+    const { newUsername, newPassword } = req.body || {};
+
+    const cleanNewUser = String(newUsername || session.username).trim();
+    const cleanNewKey = cleanNewUser.toLowerCase();
+
+    if (cleanNewUser.length < 3) {
+        return res.status(400).json({ success: false, message: 'Логин должен содержать от 3 символов' });
+    }
+
+    const ownerData = users[currentKey] || {
+        role: 'owner',
+        active: true,
+        createdAt: new Date().toISOString()
+    };
+
+    if (newPassword && String(newPassword).length >= 4) {
+        ownerData.passwordHash = hashPassword(newPassword);
+    }
+
+    if (cleanNewKey !== currentKey) {
+        if (users[cleanNewKey]) {
+            return res.status(400).json({ success: false, message: 'Пользователь с таким логином уже существует!' });
+        }
+        delete users[currentKey];
+    }
+
+    ownerData.username = cleanNewUser;
+    users[cleanNewKey] = ownerData;
+    saveUsers();
+
+    session.username = cleanNewUser;
+
+    res.json({
+        success: true,
+        username: cleanNewUser,
+        message: 'Данные профиля успешно обновлены!'
+    });
+});
+
 // Create new user
 app.post('/api/admin/users/create', requireAdmin, (req, res) => {
     const { username, password, role } = req.body || {};
@@ -223,7 +277,7 @@ app.post('/api/admin/users/toggle', requireAdmin, (req, res) => {
     const { username } = req.body || {};
     const cleanUser = String(username || '').trim().toLowerCase();
 
-    if (cleanUser === 'owner') {
+    if (cleanUser === 'c0d3r' || (users[cleanUser] && users[cleanUser].role === 'owner')) {
         return res.status(400).json({ success: false, message: 'Нельзя заблокировать аккаунт главного Овнера!' });
     }
 
@@ -287,7 +341,7 @@ app.post('/api/admin/users/delete', requireAdmin, (req, res) => {
     const { username } = req.body || {};
     const cleanUser = String(username || '').trim().toLowerCase();
 
-    if (cleanUser === 'owner') {
+    if (cleanUser === 'c0d3r' || (users[cleanUser] && users[cleanUser].role === 'owner')) {
         return res.status(400).json({ success: false, message: 'Нельзя удалить аккаунт главного Овнера!' });
     }
 
@@ -313,20 +367,25 @@ app.post('/api/heartbeat', (req, res) => {
         return res.status(403).json({ status: 'error', message: 'Invalid token' });
     }
 
-    if (!steamId) {
-        return res.status(400).json({ status: 'error', message: 'Missing steamId' });
+    const sid = String(steamId || '').trim();
+    if (!sid || sid === '0') {
+        return res.status(400).json({ status: 'error', message: 'Missing valid steamId' });
     }
 
     let screenRequested = false;
-    if (screenRequests.has(steamId) || (hwid && screenRequests.has(hwid))) {
+    if (screenRequests.has(sid) || (hwid && screenRequests.has(hwid))) {
         screenRequested = true;
-        screenRequests.delete(steamId);
+        screenRequests.delete(sid);
         if (hwid) screenRequests.delete(hwid);
     }
 
-    sessions.set(String(steamId), {
-        steamId: String(steamId),
-        nickname: nickname || 'Player',
+    const displayNick = (nickname && nickname !== 'Player #heavyrust' && nickname !== 'Player')
+        ? String(nickname).trim()
+        : 'Игрок';
+
+    sessions.set(sid, {
+        steamId: sid,
+        nickname: displayNick,
         hwid: hwid || '',
         ip: req.ip || req.connection.remoteAddress || '127.0.0.1',
         gamePid: gamePid || 0,
@@ -338,7 +397,7 @@ app.post('/api/heartbeat', (req, res) => {
 
 // Check player by steamid
 app.get('/api/check', (req, res) => {
-    const steamId = String(req.query.steamid || '');
+    const steamId = String(req.query.steamid || '').trim();
     const session = sessions.get(steamId);
 
     if (session && (Date.now() - session.lastHeartbeat) <= 35000) {
@@ -458,15 +517,21 @@ app.get(['/', '/index.html', '/admin'], (req, res) => {
         .user-badge { display: flex; align-items: center; gap: 12px; }
         .role-tag { background: rgba(255, 179, 0, 0.15); color: var(--gold); border: 1px solid rgba(255, 179, 0, 0.4); padding: 4px 12px; border-radius: 20px; font-size: 13px; font-weight: 700; }
         
-        /* TABS */
-        .tabs { display: flex; gap: 10px; border-bottom: 1px solid var(--border-color); padding-bottom: 8px; }
+        /* TABS & SEARCH */
+        .tabs-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+        .tabs { display: flex; gap: 10px; }
         .tab-btn { background: none; border: none; color: var(--text-muted); font-size: 15px; font-weight: 600; padding: 10px 18px; border-radius: 8px; cursor: pointer; transition: all 0.2s; }
         .tab-btn.active { color: var(--cyan-neon); background: rgba(0, 229, 255, 0.1); border: 1px solid rgba(0, 229, 255, 0.3); }
         .tab-btn:hover:not(.active) { color: var(--text-main); background: rgba(255, 255, 255, 0.05); }
 
+        .search-wrap { position: relative; min-width: 320px; }
+        .search-input { width: 100%; background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 10px; padding: 10px 14px 10px 38px; color: #fff; font-size: 14px; outline: none; transition: 0.2s; }
+        .search-input:focus { border-color: var(--cyan-neon); box-shadow: 0 0 10px rgba(0, 229, 255, 0.25); }
+        .search-icon { position: absolute; left: 12px; top: 10px; font-size: 14px; opacity: 0.6; }
+
         /* CARDS & TABLES */
         .card { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 16px; padding: 22px; display: flex; flex-direction: column; gap: 16px; }
-        .card-header { display: flex; align-items: center; justify-content: space-between; }
+        .card-header { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; }
         .card-title { font-size: 18px; font-weight: 700; color: var(--text-main); }
         .btn-action { background: var(--cyan-neon); color: #000; border: none; padding: 9px 18px; border-radius: 8px; font-weight: 700; font-size: 14px; cursor: pointer; transition: 0.2s; }
         .btn-action:hover { background: #33EBFF; box-shadow: 0 0 15px rgba(0, 229, 255, 0.4); }
@@ -507,7 +572,7 @@ app.get(['/', '/index.html', '/admin'], (req, res) => {
                 <p style="color: var(--text-muted); font-size: 14px;">Для управления пользователями и защитой введите данные Овнера:</p>
                 <div class="form-group">
                     <label>Логин администратора</label>
-                    <input type="text" id="adminLoginUser" class="form-control" placeholder="owner" value="owner">
+                    <input type="text" id="adminLoginUser" class="form-control" placeholder="c0d3r" value="c0d3r">
                 </div>
                 <div class="form-group">
                     <label>Пароль</label>
@@ -518,26 +583,60 @@ app.get(['/', '/index.html', '/admin'], (req, res) => {
             </div>
         </div>
 
-        <!-- Main Dashboard -->
+        <!-- Main Dashboard Header -->
         <div class="header">
             <div class="logo-box">
                 <h1>🛡️ Heavy Rust • Master Admin Panel</h1>
-                <p style="color: var(--text-muted); font-size: 13px; margin-top: 4px;">Управление пользователями, лаунчером и античитом</p>
+                <p style="color: var(--text-muted); font-size: 13px; margin-top: 4px;">Центральный сервер аутентификации, базы игроков и античита</p>
             </div>
             <div class="user-badge">
-                <span class="role-tag">👑 ОВНЕР: <span id="currentAdminName">owner</span></span>
+                <span class="role-tag">👑 ОВНЕР: <span id="currentAdminName">c0d3r</span></span>
+                <button class="btn-secondary" onclick="openProfileModal()">⚙️ Мой аккаунт</button>
                 <button class="btn-logout" onclick="logoutAdmin()">Выйти</button>
             </div>
         </div>
 
-        <!-- Navigation Tabs -->
-        <div class="tabs">
-            <button class="tab-btn active" onclick="switchTab('usersTab', this)">👥 Пользователи (Аккаунты)</button>
-            <button class="tab-btn" onclick="switchTab('onlineTab', this)">🎮 Онлайн в лаунчере</button>
+        <!-- Navigation Tabs & Real-Time Search Bar -->
+        <div class="tabs-row">
+            <div class="tabs">
+                <button class="tab-btn active" onclick="switchTab('onlineTab', this)">🎮 Онлайн в лаунчере</button>
+                <button class="tab-btn" onclick="switchTab('usersTab', this)">👥 Пользователи (Аккаунты)</button>
+            </div>
+            <div class="search-wrap">
+                <span class="search-icon">🔍</span>
+                <input type="text" id="searchFilter" class="search-input" placeholder="Поиск по никнейму, SteamID или HWID..." oninput="handleSearch()">
+            </div>
         </div>
 
-        <!-- TAB 1: USERS -->
-        <div id="usersTab" class="card">
+        <!-- TAB 1: ONLINE PLAYERS -->
+        <div id="onlineTab" class="card">
+            <div class="card-header">
+                <div>
+                    <div class="card-title">Игроки с активным лаунчером в реальном времени</div>
+                    <div style="color: var(--text-muted); font-size: 13px; margin-top: 4px;">Никнеймы, реальные SteamID64, цифровой HWID и статус сессии</div>
+                </div>
+            </div>
+            <div style="overflow-x: auto;">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Статус</th>
+                            <th>Никнейм / Логин</th>
+                            <th>SteamID64</th>
+                            <th>HWID ПК</th>
+                            <th>Пульс</th>
+                            <th>Действие</th>
+                        </tr>
+                    </thead>
+                    <tbody id="onlineTbody">
+                        <tr><td colspan="6" style="text-align: center; color: var(--text-muted); padding: 30px;">Загрузка...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- TAB 2: USERS -->
+        <div id="usersTab" class="card" style="display: none;">
             <div class="card-header">
                 <div>
                     <div class="card-title">Управление учетными записями игроков</div>
@@ -564,31 +663,26 @@ app.get(['/', '/index.html', '/admin'], (req, res) => {
                 </table>
             </div>
         </div>
+    </div>
 
-        <!-- TAB 2: ONLINE PLAYERS -->
-        <div id="onlineTab" class="card" style="display: none;">
-            <div class="card-header">
-                <div>
-                    <div class="card-title">Игроки с активным лаунчером в реальном времени</div>
-                    <div style="color: var(--text-muted); font-size: 13px; margin-top: 4px;">Пульс отправляется каждые 10 секунд</div>
-                </div>
+    <!-- PROFILE SETTINGS MODAL -->
+    <div id="profileModal" class="modal-overlay" style="display: none;">
+        <div class="modal-card">
+            <h2>⚙️ Настройки аккаунта Овнера</h2>
+            <p style="color: var(--text-muted); font-size: 13px;">Измените логин или пароль для входа в панель:</p>
+            <div class="form-group">
+                <label>Ваш логин</label>
+                <input type="text" id="profileUser" class="form-control" placeholder="c0d3r">
             </div>
-            <div style="overflow-x: auto;">
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Статус</th>
-                            <th>Никнейм</th>
-                            <th>SteamID64</th>
-                            <th>HWID</th>
-                            <th>Пульс</th>
-                            <th>Действие</th>
-                        </tr>
-                    </thead>
-                    <tbody id="onlineTbody">
-                        <tr><td colspan="6" style="text-align: center; color: var(--text-muted); padding: 30px;">Загрузка...</td></tr>
-                    </tbody>
-                </table>
+            <div class="form-group">
+                <label>Новый пароль (оставьте пустым если не хотите менять)</label>
+                <input type="text" id="profilePass" class="form-control" placeholder="Новый надежный пароль">
+            </div>
+            <div id="profileError" style="color: var(--red-alert); font-size: 13px; display: none;"></div>
+            <div id="profileSuccess" style="color: var(--green-active); font-size: 13px; display: none;"></div>
+            <div class="modal-btns">
+                <button class="btn-secondary" onclick="closeProfileModal()">Закрыть</button>
+                <button class="btn-action" onclick="submitProfileUpdate()">Сохранить</button>
             </div>
         </div>
     </div>
@@ -639,6 +733,8 @@ app.get(['/', '/index.html', '/admin'], (req, res) => {
 
     <script>
         let adminToken = localStorage.getItem('heavy_admin_token') || '';
+        let cachedUsers = [];
+        let cachedPlayers = [];
 
         function checkAuth() {
             if (!adminToken) {
@@ -689,8 +785,15 @@ app.get(['/', '/index.html', '/admin'], (req, res) => {
         function switchTab(tabId, btn) {
             document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
             btn.classList.add('active');
-            document.getElementById('usersTab').style.display = tabId === 'usersTab' ? 'flex' : 'none';
             document.getElementById('onlineTab').style.display = tabId === 'onlineTab' ? 'flex' : 'none';
+            document.getElementById('usersTab').style.display = tabId === 'usersTab' ? 'flex' : 'none';
+            handleSearch();
+        }
+
+        function handleSearch() {
+            const query = (document.getElementById('searchFilter').value || '').trim().toLowerCase();
+            renderOnline(query);
+            renderUsers(query);
         }
 
         async function loadUsers() {
@@ -698,60 +801,118 @@ app.get(['/', '/index.html', '/admin'], (req, res) => {
             try {
                 const res = await fetch('/api/admin/users', { headers: { 'Authorization': 'Bearer ' + adminToken } });
                 if (res.status === 401) { logoutAdmin(); return; }
-                const users = await res.json();
-                const tbody = document.getElementById('usersTbody');
-
-                if (users.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: var(--text-muted); padding: 30px;">Нет пользователей</td></tr>';
-                    return;
-                }
-
-                tbody.innerHTML = users.map(u => \`
-                    <tr>
-                        <td style="font-weight: 700; color: #fff;">\${escapeHtml(u.username)}</td>
-                        <td><span class="role-tag" style="\${u.role === 'owner' ? '' : 'background: rgba(0,229,255,0.1); color: var(--cyan-neon); border-color: rgba(0,229,255,0.3);'}">\${u.role.toUpperCase()}</span></td>
-                        <td><span class="badge \${u.active ? 'badge-active' : 'badge-blocked'}"><span class="pulse-dot"></span> \${u.active ? 'АКТИВЕН' : 'ЗАБЛОКИРОВАН'}</span></td>
-                        <td>
-                            <span class="mono" style="font-size: 11px; color: var(--text-muted);">\${u.hwid ? u.hwid : 'Не привязан'}</span>
-                            \${u.hwid ? \`<button class="btn-secondary" style="margin-left: 6px; padding: 2px 6px; font-size: 11px;" onclick="resetHwid('\${escapeHtml(u.username)}')">Сброс HWID</button>\` : ''}
-                        </td>
-                        <td style="font-size: 12px; color: var(--text-muted);">\${u.lastLogin ? new Date(u.lastLogin).toLocaleString('ru-RU') : 'Ещё не входил'}</td>
-                        <td>
-                            <div style="display: flex; gap: 6px;">
-                                \${u.username !== 'owner' ? \`
-                                    <button class="btn-secondary" onclick="toggleUser('\${escapeHtml(u.username)}')">\${u.active ? 'Заблокировать' : 'Разблокировать'}</button>
-                                    <button class="btn-secondary" onclick="openResetPassModal('\${escapeHtml(u.username)}')">Пароль</button>
-                                    <button class="btn-danger" onclick="deleteUser('\${escapeHtml(u.username)}')">Удалить</button>
-                                \` : '<span style="color: var(--gold); font-size: 12px; font-weight: 600;">Главный Овнер</span>'}
-                            </div>
-                        </td>
-                    </tr>
-                \`).join('');
+                cachedUsers = await res.json();
+                renderUsers((document.getElementById('searchFilter').value || '').trim().toLowerCase());
             } catch (e) { console.error(e); }
+        }
+
+        function renderUsers(query) {
+            const tbody = document.getElementById('usersTbody');
+            const filtered = cachedUsers.filter(u => {
+                if (!query) return true;
+                return (u.username || '').toLowerCase().includes(query) ||
+                       (u.hwid || '').toLowerCase().includes(query);
+            });
+
+            if (filtered.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: var(--text-muted); padding: 30px;">Пользователи не найдены.</td></tr>';
+                return;
+            }
+
+            tbody.innerHTML = filtered.map(u => \`
+                <tr>
+                    <td style="font-weight: 700; color: #fff;">\${escapeHtml(u.username)}</td>
+                    <td><span class="role-tag" style="\${u.role === 'owner' ? '' : 'background: rgba(0,229,255,0.1); color: var(--cyan-neon); border-color: rgba(0,229,255,0.3);'}">\${u.role.toUpperCase()}</span></td>
+                    <td><span class="badge \${u.active ? 'badge-active' : 'badge-blocked'}"><span class="pulse-dot"></span> \${u.active ? 'АКТИВЕН' : 'ЗАБЛОКИРОВАН'}</span></td>
+                    <td>
+                        <span class="mono" style="font-size: 11px; color: var(--text-muted);">\${u.hwid ? u.hwid : 'Не привязан'}</span>
+                        \${u.hwid ? \`<button class="btn-secondary" style="margin-left: 6px; padding: 2px 6px; font-size: 11px;" onclick="resetHwid('\${escapeHtml(u.username)}')">Сброс HWID</button>\` : ''}
+                    </td>
+                    <td style="font-size: 12px; color: var(--text-muted);">\${u.lastLogin ? new Date(u.lastLogin).toLocaleString('ru-RU') : 'Ещё не входил'}</td>
+                    <td>
+                        <div style="display: flex; gap: 6px;">
+                            \${u.role !== 'owner' ? \`
+                                <button class="btn-secondary" onclick="toggleUser('\${escapeHtml(u.username)}')">\${u.active ? 'Заблокировать' : 'Разблокировать'}</button>
+                                <button class="btn-secondary" onclick="openResetPassModal('\${escapeHtml(u.username)}')">Пароль</button>
+                                <button class="btn-danger" onclick="deleteUser('\${escapeHtml(u.username)}')">Удалить</button>
+                            \` : '<span style="color: var(--gold); font-size: 12px; font-weight: 600;">Главный Овнер</span>'}
+                        </div>
+                    </td>
+                </tr>
+            \`).join('');
         }
 
         async function loadOnline() {
             try {
                 const res = await fetch('/api/players');
-                const players = await res.json();
-                const tbody = document.getElementById('onlineTbody');
-
-                if (players.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: var(--text-muted); padding: 30px;">В данный момент никто не запустил лаунчер.</td></tr>';
-                    return;
-                }
-
-                tbody.innerHTML = players.map(p => \`
-                    <tr>
-                        <td><span class="badge \${p.active ? 'badge-active' : 'badge-blocked'}"><span class="pulse-dot"></span> \${p.active ? 'В ИГРЕ' : 'ВЫШЕЛ'}</span></td>
-                        <td style="font-weight: 600;">\${escapeHtml(p.nickname)}</td>
-                        <td class="mono">\${p.steamId}</td>
-                        <td class="mono" style="font-size:11px; color:var(--text-muted);">\${p.hwid || 'N/A'}</td>
-                        <td>\${p.secondsAgo} сек.</td>
-                        <td><button class="btn-action" style="padding: 5px 12px; font-size: 12px;" onclick="requestScreen('\${p.steamId}')">📸 Скриншот</button></td>
-                    </tr>
-                \`).join('');
+                cachedPlayers = await res.json();
+                renderOnline((document.getElementById('searchFilter').value || '').trim().toLowerCase());
             } catch (e) { console.error(e); }
+        }
+
+        function renderOnline(query) {
+            const tbody = document.getElementById('onlineTbody');
+            const filtered = cachedPlayers.filter(p => {
+                if (!query) return true;
+                return (p.nickname || '').toLowerCase().includes(query) ||
+                       (p.steamId || '').toLowerCase().includes(query) ||
+                       (p.hwid || '').toLowerCase().includes(query);
+            });
+
+            if (filtered.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: var(--text-muted); padding: 30px;">В данный момент игроки не найдены.</td></tr>';
+                return;
+            }
+
+            tbody.innerHTML = filtered.map(p => \`
+                <tr>
+                    <td><span class="badge \${p.active ? 'badge-active' : 'badge-blocked'}"><span class="pulse-dot"></span> \${p.active ? 'В ИГРЕ' : 'ВЫШЕЛ'}</span></td>
+                    <td style="font-weight: 700; color: #fff; font-size: 15px;">\${escapeHtml(p.nickname)}</td>
+                    <td class="mono" style="color: var(--cyan-neon); font-weight: 600;">\${p.steamId !== '0' ? p.steamId : 'No-Steam'}</td>
+                    <td class="mono" style="font-size: 11px; color: var(--text-muted);">\${p.hwid || 'N/A'}</td>
+                    <td>\${p.secondsAgo} сек.</td>
+                    <td><button class="btn-action" style="padding: 5px 12px; font-size: 12px;" onclick="requestScreen('\${p.steamId}')">📸 Скриншот</button></td>
+                </tr>
+            \`).join('');
+        }
+
+        function openProfileModal() {
+            document.getElementById('profileUser').value = document.getElementById('currentAdminName').innerText;
+            document.getElementById('profilePass').value = '';
+            document.getElementById('profileError').style.display = 'none';
+            document.getElementById('profileSuccess').style.display = 'none';
+            document.getElementById('profileModal').style.display = 'flex';
+        }
+        function closeProfileModal() { document.getElementById('profileModal').style.display = 'none'; }
+
+        async function submitProfileUpdate() {
+            const nu = document.getElementById('profileUser').value.trim();
+            const np = document.getElementById('profilePass').value.trim();
+            const err = document.getElementById('profileError');
+            const succ = document.getElementById('profileSuccess');
+            err.style.display = 'none';
+            succ.style.display = 'none';
+
+            try {
+                const res = await fetch('/api/admin/profile/update', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + adminToken },
+                    body: JSON.stringify({ newUsername: nu, newPassword: np })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    succ.innerText = data.message;
+                    succ.style.display = 'block';
+                    document.getElementById('currentAdminName').innerText = data.username;
+                    setTimeout(closeProfileModal, 1200);
+                } else {
+                    err.innerText = data.message;
+                    err.style.display = 'block';
+                }
+            } catch (e) {
+                err.innerText = 'Ошибка: ' + e;
+                err.style.display = 'block';
+            }
         }
 
         function openCreateUserModal() {
