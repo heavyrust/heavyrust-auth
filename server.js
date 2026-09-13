@@ -74,16 +74,39 @@ app.get('/api/check', (req, res) => {
     }
 });
 
+// 2.1 Get Bearer Token for HeavyAC plugin
+app.post('/internal_get_bearer_token', (req, res) => {
+    res.json({ token: '7e8b839f2048991a' });
+});
+
+// Helper function to find active session by SteamID or Nickname
+function findActiveSession(userId, playerName) {
+    if (userId) {
+        const byId = sessions.get(String(userId));
+        if (byId && (Date.now() - byId.lastHeartbeat) <= 35000) return byId;
+    }
+    if (playerName) {
+        const cleanName = String(playerName).trim().toLowerCase();
+        for (const s of sessions.values()) {
+            if (s.nickname && s.nickname.trim().toLowerCase() === cleanName) {
+                if ((Date.now() - s.lastHeartbeat) <= 35000) return s;
+            }
+        }
+    }
+    return null;
+}
+
 // 3. Single player check on join for HeavyAC.cs (POST /internal_player_state)
 app.post('/internal_player_state', (req, res) => {
     const list = Array.isArray(req.body) ? req.body : [req.body];
     const first = list[0] || {};
     const id = String(first.userId || first.userid || '');
-    const session = sessions.get(id);
-    const isValid = session && (Date.now() - session.lastHeartbeat) <= 35000;
+    const name = String(first.playerName || first.name || '');
+    const session = findActiveSession(id, name);
+    const isValid = Boolean(session);
     res.json({
         userId: id,
-        valid: Boolean(isValid),
+        valid: isValid,
         hban: false,
         hbanMessage: '',
         hwid: (session && session.hwid) || ''
@@ -95,11 +118,12 @@ app.post('/internal_players_check', (req, res) => {
     const playerList = Array.isArray(req.body) ? req.body : [];
     const results = playerList.map(p => {
         const id = String(p.userId || p.userid || '');
-        const session = sessions.get(id);
-        const isValid = session && (Date.now() - session.lastHeartbeat) <= 35000;
+        const name = String(p.playerName || p.name || '');
+        const session = findActiveSession(id, name);
+        const isValid = Boolean(session);
         return {
             userId: id,
-            valid: Boolean(isValid),
+            valid: isValid,
             hban: false,
             hbanMessage: '',
             hwid: (session && session.hwid) || ''
