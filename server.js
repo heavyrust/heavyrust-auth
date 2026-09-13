@@ -22,6 +22,14 @@ setInterval(() => {
     }
 }, 60000);
 
+// Self-keepalive ping to prevent Render free tier sleep
+const https = require('https');
+setInterval(() => {
+    https.get('https://heavyrust-auth.onrender.com/api/players', (res) => {
+        res.on('data', () => {});
+    }).on('error', () => {});
+}, 9 * 60 * 1000);
+
 // 1. Heartbeat from HeavyRustLauncher
 app.post('/api/heartbeat', (req, res) => {
     const { steamId, nickname, hwid, token, gamePid } = req.body || {};
