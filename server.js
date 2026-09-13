@@ -1,18 +1,80 @@
 const express = require('express');
 const cors = require('cors');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const https = require('https');
 
 const app = express();
 const PORT = process.env.PORT || 8080;
 const VALID_TOKEN = '7e8b839f2048991a';
+const USERS_FILE = path.join(__dirname, 'users.json');
 
 app.use(cors());
 app.use(express.json());
 
-// In-memory sessions storage
-const sessions = new Map();
-const screenRequests = new Map();
+// -------------------------------------------------------------
+// USER DATABASE & AUTH SYSTEM
+// -------------------------------------------------------------
+let users = {};
 
-// Periodic cleanup
+function hashPassword(pwd) {
+    return crypto.createHash('sha256').update(String(pwd) + '_heavyrust_salt_2026').digest('hex');
+}
+
+function loadUsers() {
+    try {
+        if (fs.existsSync(USERS_FILE)) {
+            users = JSON.parse(fs.readFileSync(USERS_FILE, 'utf8'));
+        }
+    } catch (e) {
+        console.error('Error loading users.json:', e);
+        users = {};
+    }
+
+    // Ensure Master Owner Account
+    if (!users['owner']) {
+        users['owner'] = {
+            username: 'owner',
+            passwordHash: hashPassword('heavyowner2026!'),
+            role: 'owner',
+            active: true,
+            hwid: '',
+            createdAt: new Date().toISOString(),
+            lastLogin: null
+        };
+        saveUsers();
+    }
+}
+
+function saveUsers() {
+    try {
+        fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2), 'utf8');
+    } catch (e) {
+        console.error('Error saving users.json:', e);
+    }
+}
+
+loadUsers();
+
+// In-memory active tokens & sessions
+const userTokens = new Map();   // token -> { username, role, hwid, createdAt }
+const adminTokens = new Set();  // set of admin/owner tokens
+const sessions = new Map();     // steamId -> player session
+const screenRequests = new Map(); // target -> timestamp
+
+// Middleware to verify admin token
+function requireAdmin(req, res, next) {
+    const authHeader = req.headers['authorization'] || '';
+    const token = authHeader.replace(/^Bearer\s+/i, '').trim();
+
+    if (!token || !adminTokens.has(token)) {
+        return res.status(401).json({ status: 'error', message: 'Unauthorized: Owner or Admin rights required' });
+    }
+    next();
+}
+
+// Cleanup expired sessions
 setInterval(() => {
     const cutoff = Date.now() - 10 * 60 * 1000;
     for (const [id, session] of sessions.entries()) {
@@ -23,14 +85,227 @@ setInterval(() => {
 }, 60000);
 
 // Self-keepalive ping to prevent Render free tier sleep
-const https = require('https');
 setInterval(() => {
     https.get('https://heavyrust-auth.onrender.com/api/players', (res) => {
         res.on('data', () => {});
     }).on('error', () => {});
 }, 9 * 60 * 1000);
 
-// 1. Heartbeat from HeavyRustLauncher
+// -------------------------------------------------------------
+// AUTHENTICATION APIS (FOR LAUNCHER & ADMIN PANEL)
+// -------------------------------------------------------------
+
+// 1. User Login (Launcher or Web Panel)
+app.post('/api/auth/login', (req, res) => {
+    const { username, password, hwid } = req.body || {};
+    const cleanUser = String(username || '').trim().toLowerCase();
+
+    const user = users[cleanUser];
+    if (!user) {
+        return res.status(401).json({ success: false, message: 'Пользователь с таким логином не найден' });
+    }
+
+    if (!user.active) {
+        return res.status(403).json({ success: false, message: 'Ваш аккаунт заблокирован администратором!' });
+    }
+
+    const hashed = hashPassword(password);
+    if (user.passwordHash !== hashed) {
+        return res.status(401).json({ success: false, message: 'Неверный пароль' });
+    }
+
+    // Optional HWID binding for regular users
+    if (hwid && user.role !== 'owner' && user.role !== 'admin') {
+        if (user.hwid && user.hwid !== hwid) {
+            return res.status(403).json({ success: false, message: 'Вход разрешен только с привязанного ПК (HWID не совпадает)!' });
+        }
+        if (!user.hwid) {
+            user.hwid = hwid;
+        }
+    }
+
+    user.lastLogin = new Date().toISOString();
+    saveUsers();
+
+    // Generate secure session token
+    const token = crypto.randomBytes(32).toString('hex');
+    userTokens.set(token, {
+        username: user.username,
+        role: user.role,
+        hwid: hwid || user.hwid || '',
+        createdAt: Date.now()
+    });
+
+    if (user.role === 'owner' || user.role === 'admin') {
+        adminTokens.add(token);
+    }
+
+    res.json({
+        success: true,
+        token: token,
+        username: user.username,
+        role: user.role,
+        message: 'Авторизация успешна'
+    });
+});
+
+// 2. Verify Token (Launcher startup check)
+app.post('/api/auth/verify_token', (req, res) => {
+    const { token } = req.body || {};
+    if (!token || !userTokens.has(token)) {
+        return res.json({ valid: false, message: 'Сессия недействительна' });
+    }
+
+    const session = userTokens.get(token);
+    const user = users[session.username.toLowerCase()];
+
+    if (!user || !user.active) {
+        userTokens.delete(token);
+        adminTokens.delete(token);
+        return res.json({ valid: false, message: 'Пользователь заблокирован или удален' });
+    }
+
+    res.json({
+        valid: true,
+        username: user.username,
+        role: user.role
+    });
+});
+
+// -------------------------------------------------------------
+// OWNER & ADMIN USER MANAGEMENT APIS
+// -------------------------------------------------------------
+
+// List all users
+app.get('/api/admin/users', requireAdmin, (req, res) => {
+    const list = Object.values(users).map(u => ({
+        username: u.username,
+        role: u.role,
+        active: Boolean(u.active),
+        hwid: u.hwid || '',
+        createdAt: u.createdAt,
+        lastLogin: u.lastLogin
+    }));
+    res.json(list);
+});
+
+// Create new user
+app.post('/api/admin/users/create', requireAdmin, (req, res) => {
+    const { username, password, role } = req.body || {};
+    const cleanUser = String(username || '').trim().toLowerCase();
+
+    if (!cleanUser || cleanUser.length < 3) {
+        return res.status(400).json({ success: false, message: 'Логин должен содержать минимум 3 символа' });
+    }
+    if (!password || String(password).length < 4) {
+        return res.status(400).json({ success: false, message: 'Пароль должен содержать минимум 4 символа' });
+    }
+    if (users[cleanUser]) {
+        return res.status(400).json({ success: false, message: 'Пользователь с таким логином уже существует!' });
+    }
+
+    users[cleanUser] = {
+        username: String(username).trim(),
+        passwordHash: hashPassword(password),
+        role: role === 'admin' ? 'admin' : 'user',
+        active: true,
+        hwid: '',
+        createdAt: new Date().toISOString(),
+        lastLogin: null
+    };
+    saveUsers();
+
+    res.json({ success: true, message: `Пользователь ${username} успешно создан!` });
+});
+
+// Toggle user active status (Block / Unblock)
+app.post('/api/admin/users/toggle', requireAdmin, (req, res) => {
+    const { username } = req.body || {};
+    const cleanUser = String(username || '').trim().toLowerCase();
+
+    if (cleanUser === 'owner') {
+        return res.status(400).json({ success: false, message: 'Нельзя заблокировать аккаунт главного Овнера!' });
+    }
+
+    const user = users[cleanUser];
+    if (!user) {
+        return res.status(404).json({ success: false, message: 'Пользователь не найден' });
+    }
+
+    user.active = !user.active;
+    saveUsers();
+
+    // Revoke active sessions if blocked
+    if (!user.active) {
+        for (const [tok, sess] of userTokens.entries()) {
+            if (sess.username.toLowerCase() === cleanUser) {
+                userTokens.delete(tok);
+                adminTokens.delete(tok);
+            }
+        }
+    }
+
+    res.json({ success: true, active: user.active, message: user.active ? 'Пользователь разблокирован' : 'Пользователь заблокирован' });
+});
+
+// Reset user HWID
+app.post('/api/admin/users/reset_hwid', requireAdmin, (req, res) => {
+    const { username } = req.body || {};
+    const cleanUser = String(username || '').trim().toLowerCase();
+
+    const user = users[cleanUser];
+    if (!user) {
+        return res.status(404).json({ success: false, message: 'Пользователь не найден' });
+    }
+
+    user.hwid = '';
+    saveUsers();
+    res.json({ success: true, message: `HWID пользователя ${user.username} успешно сброшен.` });
+});
+
+// Reset user password
+app.post('/api/admin/users/reset_password', requireAdmin, (req, res) => {
+    const { username, newPassword } = req.body || {};
+    const cleanUser = String(username || '').trim().toLowerCase();
+
+    const user = users[cleanUser];
+    if (!user) {
+        return res.status(404).json({ success: false, message: 'Пользователь не найден' });
+    }
+    if (!newPassword || String(newPassword).length < 4) {
+        return res.status(400).json({ success: false, message: 'Пароль должен содержать от 4 символов' });
+    }
+
+    user.passwordHash = hashPassword(newPassword);
+    saveUsers();
+
+    res.json({ success: true, message: `Пароль для ${user.username} успешно изменён!` });
+});
+
+// Delete user
+app.post('/api/admin/users/delete', requireAdmin, (req, res) => {
+    const { username } = req.body || {};
+    const cleanUser = String(username || '').trim().toLowerCase();
+
+    if (cleanUser === 'owner') {
+        return res.status(400).json({ success: false, message: 'Нельзя удалить аккаунт главного Овнера!' });
+    }
+
+    if (!users[cleanUser]) {
+        return res.status(404).json({ success: false, message: 'Пользователь не найден' });
+    }
+
+    delete users[cleanUser];
+    saveUsers();
+
+    res.json({ success: true, message: `Пользователь ${username} успешно удалён.` });
+});
+
+// -------------------------------------------------------------
+// LAUNCHER & SERVER PULSE / VERIFICATION APIS
+// -------------------------------------------------------------
+
+// Heartbeat from HeavyRustLauncher
 app.post('/api/heartbeat', (req, res) => {
     const { steamId, nickname, hwid, token, gamePid } = req.body || {};
 
@@ -61,7 +336,7 @@ app.post('/api/heartbeat', (req, res) => {
     res.json({ status: 'ok', valid: true, request_screen: screenRequested });
 });
 
-// 2. Check player (GET /api/check?steamid=...)
+// Check player by steamid
 app.get('/api/check', (req, res) => {
     const steamId = String(req.query.steamid || '');
     const session = sessions.get(steamId);
@@ -74,12 +349,12 @@ app.get('/api/check', (req, res) => {
     }
 });
 
-// 2.1 Get Bearer Token for HeavyAC plugin
+// Bearer token for HeavyAC
 app.post('/internal_get_bearer_token', (req, res) => {
-    res.json({ token: '7e8b839f2048991a' });
+    res.json({ token: VALID_TOKEN });
 });
 
-// Helper function to find active session by SteamID or Nickname
+// Find active session helper
 function findActiveSession(userId, playerName) {
     if (userId) {
         const byId = sessions.get(String(userId));
@@ -96,7 +371,7 @@ function findActiveSession(userId, playerName) {
     return null;
 }
 
-// 3. Single player check on join for HeavyAC.cs (POST /internal_player_state)
+// Single player check on join for HeavyAC.cs
 app.post('/internal_player_state', (req, res) => {
     const list = Array.isArray(req.body) ? req.body : [req.body];
     const first = list[0] || {};
@@ -113,7 +388,7 @@ app.post('/internal_player_state', (req, res) => {
     });
 });
 
-// 4. Bulk check for HeavyAC.cs (POST /internal_players_check)
+// Bulk check for HeavyAC.cs
 app.post('/internal_players_check', (req, res) => {
     const playerList = Array.isArray(req.body) ? req.body : [];
     const results = playerList.map(p => {
@@ -132,7 +407,7 @@ app.post('/internal_players_check', (req, res) => {
     res.json(results);
 });
 
-// 4. Admin screen request (POST /api/screen_request)
+// Screen request API
 app.post('/api/screen_request', (req, res) => {
     const { target } = req.body || {};
     if (target) {
@@ -142,7 +417,7 @@ app.post('/api/screen_request', (req, res) => {
     res.status(400).json({ status: 'error', message: 'Missing target' });
 });
 
-// 5. Active players list (GET /api/players)
+// Active players list
 app.get('/api/players', (req, res) => {
     const now = Date.now();
     const list = Array.from(sessions.values()).map(s => ({
@@ -156,99 +431,444 @@ app.get('/api/players', (req, res) => {
     res.json(list);
 });
 
-// 6. Web Dashboard
+// -------------------------------------------------------------
+// WEB ADMIN PANEL (OWNER DASHBOARD)
+// -------------------------------------------------------------
 app.get(['/', '/index.html', '/admin'], (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Heavy Rust — AntiCheat Master Dashboard</title>
-    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+    <title>Heavy Rust • Панель Овнера и Античита</title>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
     <style>
         :root {
-            --bg-base: #0D1117; --bg-card: #161B22; --bg-header: #21262D;
+            --bg-base: #0D1117; --bg-card: #161B22; --bg-header: #21262D; --bg-input: #0A0D12;
             --border-color: rgba(255, 255, 255, 0.1); --cyan-neon: #00E5FF;
-            --green-active: #00E676; --red-alert: #FF1744; --text-main: #F0F6FC; --text-muted: #8B949E;
+            --green-active: #00E676; --red-alert: #FF3366; --gold: #FFB300; --text-main: #F0F6FC; --text-muted: #8B949E;
         }
         * { box-sizing: border-box; margin: 0; padding: 0; }
-        body { font-family: 'Outfit', sans-serif; background: var(--bg-base); color: var(--text-main); padding: 30px 20px; display: flex; justify-content: center; }
-        .container { width: 100%; max-width: 1100px; display: flex; flex-direction: column; gap: 24px; }
-        .header { display: flex; align-items: center; justify-content: space-between; padding: 24px 28px; background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 16px; }
-        .logo-box h1 { font-size: 24px; font-weight: 800; color: var(--cyan-neon); text-transform: uppercase; }
-        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; }
-        .stat-card { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 14px; padding: 20px; }
-        .stat-card .label { font-size: 13px; color: var(--text-muted); text-transform: uppercase; }
-        .stat-card .val { font-size: 28px; font-weight: 700; color: var(--cyan-neon); margin-top: 6px; }
-        .table-wrap { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 16px; overflow: hidden; }
+        body { font-family: 'Outfit', sans-serif; background: var(--bg-base); color: var(--text-main); min-height: 100vh; display: flex; justify-content: center; padding: 24px 16px; }
+        .container { width: 100%; max-width: 1200px; display: flex; flex-direction: column; gap: 20px; }
+        
+        /* HEADER */
+        .header { display: flex; align-items: center; justify-content: space-between; padding: 20px 28px; background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 16px; }
+        .logo-box h1 { font-size: 22px; font-weight: 800; color: var(--cyan-neon); text-transform: uppercase; letter-spacing: 0.5px; }
+        .user-badge { display: flex; align-items: center; gap: 12px; }
+        .role-tag { background: rgba(255, 179, 0, 0.15); color: var(--gold); border: 1px solid rgba(255, 179, 0, 0.4); padding: 4px 12px; border-radius: 20px; font-size: 13px; font-weight: 700; }
+        
+        /* TABS */
+        .tabs { display: flex; gap: 10px; border-bottom: 1px solid var(--border-color); padding-bottom: 8px; }
+        .tab-btn { background: none; border: none; color: var(--text-muted); font-size: 15px; font-weight: 600; padding: 10px 18px; border-radius: 8px; cursor: pointer; transition: all 0.2s; }
+        .tab-btn.active { color: var(--cyan-neon); background: rgba(0, 229, 255, 0.1); border: 1px solid rgba(0, 229, 255, 0.3); }
+        .tab-btn:hover:not(.active) { color: var(--text-main); background: rgba(255, 255, 255, 0.05); }
+
+        /* CARDS & TABLES */
+        .card { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 16px; padding: 22px; display: flex; flex-direction: column; gap: 16px; }
+        .card-header { display: flex; align-items: center; justify-content: space-between; }
+        .card-title { font-size: 18px; font-weight: 700; color: var(--text-main); }
+        .btn-action { background: var(--cyan-neon); color: #000; border: none; padding: 9px 18px; border-radius: 8px; font-weight: 700; font-size: 14px; cursor: pointer; transition: 0.2s; }
+        .btn-action:hover { background: #33EBFF; box-shadow: 0 0 15px rgba(0, 229, 255, 0.4); }
+        .btn-danger { background: rgba(255, 51, 102, 0.15); color: var(--red-alert); border: 1px solid rgba(255, 51, 102, 0.3); padding: 6px 12px; border-radius: 6px; font-weight: 600; font-size: 12px; cursor: pointer; }
+        .btn-danger:hover { background: var(--red-alert); color: #fff; }
+        .btn-secondary { background: rgba(255, 255, 255, 0.08); color: var(--text-main); border: 1px solid var(--border-color); padding: 6px 12px; border-radius: 6px; font-weight: 600; font-size: 12px; cursor: pointer; }
+        .btn-secondary:hover { background: rgba(255, 255, 255, 0.15); }
+        .btn-logout { background: rgba(255, 255, 255, 0.06); color: var(--text-muted); border: 1px solid var(--border-color); padding: 6px 14px; border-radius: 8px; cursor: pointer; font-size: 13px; font-weight: 600; }
+        .btn-logout:hover { color: var(--red-alert); border-color: var(--red-alert); }
+
         table { width: 100%; border-collapse: collapse; text-align: left; }
-        th { background: var(--bg-header); padding: 14px 18px; font-size: 13px; text-transform: uppercase; color: var(--text-muted); border-bottom: 1px solid var(--border-color); }
-        td { padding: 14px 18px; font-size: 14px; border-bottom: 1px solid rgba(255,255,255,0.05); }
-        tr:hover { background: rgba(0, 229, 255, 0.03); }
+        th { background: var(--bg-header); padding: 12px 16px; font-size: 13px; text-transform: uppercase; color: var(--text-muted); border-bottom: 1px solid var(--border-color); }
+        td { padding: 14px 16px; font-size: 14px; border-bottom: 1px solid rgba(255, 255, 255, 0.05); }
+        tr:hover { background: rgba(0, 229, 255, 0.02); }
         .badge { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: 600; }
         .badge-active { background: rgba(0, 230, 118, 0.15); color: var(--green-active); }
-        .badge-offline { background: rgba(255, 23, 68, 0.15); color: var(--red-alert); }
-        .pulse-dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; box-shadow: 0 0 8px currentColor; }
-        .btn-screen { background: rgba(0, 229, 255, 0.1); color: var(--cyan-neon); border: 1px solid var(--cyan-neon); padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 12px; font-weight: 600; }
-        .btn-screen:hover { background: var(--cyan-neon); color: #000; }
+        .badge-blocked { background: rgba(255, 51, 102, 0.15); color: var(--red-alert); }
+        .pulse-dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; box-shadow: 0 0 8px currentColor; }
         .mono { font-family: 'JetBrains Mono', monospace; font-size: 13px; }
+
+        /* MODAL */
+        .modal-overlay { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.75); backdrop-filter: blur(8px); display: flex; align-items: center; justify-content: center; z-index: 100; }
+        .modal-card { background: var(--bg-card); border: 1px solid rgba(0, 229, 255, 0.3); width: 100%; max-width: 440px; border-radius: 16px; padding: 28px; display: flex; flex-direction: column; gap: 18px; box-shadow: 0 0 40px rgba(0, 229, 255, 0.15); }
+        .modal-card h2 { font-size: 20px; font-weight: 700; color: var(--cyan-neon); }
+        .form-group { display: flex; flex-direction: column; gap: 8px; }
+        .form-group label { font-size: 13px; color: var(--text-muted); text-transform: uppercase; font-weight: 600; }
+        .form-control { background: var(--bg-input); border: 1px solid var(--border-color); border-radius: 8px; padding: 12px 14px; color: #fff; font-size: 15px; outline: none; transition: 0.2s; }
+        .form-control:focus { border-color: var(--cyan-neon); box-shadow: 0 0 10px rgba(0, 229, 255, 0.2); }
+        .modal-btns { display: flex; gap: 10px; justify-content: flex-end; margin-top: 10px; }
     </style>
 </head>
 <body>
-    <div class="container">
+    <div class="container" id="appContainer">
+        <!-- Auth Login Screen (if not logged in) -->
+        <div id="loginScreen" class="modal-overlay" style="display: none;">
+            <div class="modal-card">
+                <h2>👑 Вход в Панель Овнера</h2>
+                <p style="color: var(--text-muted); font-size: 14px;">Для управления пользователями и защитой введите данные Овнера:</p>
+                <div class="form-group">
+                    <label>Логин администратора</label>
+                    <input type="text" id="adminLoginUser" class="form-control" placeholder="owner" value="owner">
+                </div>
+                <div class="form-group">
+                    <label>Пароль</label>
+                    <input type="password" id="adminLoginPass" class="form-control" placeholder="••••••••" onkeydown="if(event.key==='Enter')loginAdmin()">
+                </div>
+                <div id="loginError" style="color: var(--red-alert); font-size: 13px; display: none;"></div>
+                <button class="btn-action" onclick="loginAdmin()" style="margin-top: 6px; padding: 12px;">Войти в панель управления</button>
+            </div>
+        </div>
+
+        <!-- Main Dashboard -->
         <div class="header">
             <div class="logo-box">
-                <h1>🛡️ Heavy Rust Auth Server</h1>
-                <p style="color: var(--text-muted); font-size: 13px; margin-top: 4px;">Центральный сервер аутентификации лаунчера и античита</p>
+                <h1>🛡️ Heavy Rust • Master Admin Panel</h1>
+                <p style="color: var(--text-muted); font-size: 13px; margin-top: 4px;">Управление пользователями, лаунчером и античитом</p>
             </div>
-            <div class="badge badge-active"><span class="pulse-dot"></span> СЕРВЕР АКТИВЕН</div>
+            <div class="user-badge">
+                <span class="role-tag">👑 ОВНЕР: <span id="currentAdminName">owner</span></span>
+                <button class="btn-logout" onclick="logoutAdmin()">Выйти</button>
+            </div>
         </div>
-        <div class="stats-grid">
-            <div class="stat-card"><div class="label">Игроков с лаунчером онлайн</div><div id="onlineCount" class="val">0</div></div>
-            <div class="stat-card"><div class="label">Всего сессий в памяти</div><div id="totalCount" class="val">0</div></div>
-            <div class="stat-card"><div class="label">Статус защиты сервера</div><div class="val" style="color: var(--green-active);">СТРОГИЙ ВХОД</div></div>
+
+        <!-- Navigation Tabs -->
+        <div class="tabs">
+            <button class="tab-btn active" onclick="switchTab('usersTab', this)">👥 Пользователи (Аккаунты)</button>
+            <button class="tab-btn" onclick="switchTab('onlineTab', this)">🎮 Онлайн в лаунчере</button>
         </div>
-        <div class="table-wrap">
-            <table>
-                <thead><tr><th>Статус</th><th>Никнейм</th><th>SteamID64</th><th>HWID Аппаратуры</th><th>Пульс (сек. назад)</th><th>Действие</th></tr></thead>
-                <tbody id="playersTbody"><tr><td colspan="6" style="text-align:center; color: var(--text-muted); padding: 30px;">Загрузка данных...</td></tr></tbody>
-            </table>
+
+        <!-- TAB 1: USERS -->
+        <div id="usersTab" class="card">
+            <div class="card-header">
+                <div>
+                    <div class="card-title">Управление учетными записями игроков</div>
+                    <div style="color: var(--text-muted); font-size: 13px; margin-top: 4px;">Только созданные здесь пользователи могут войти в лаунчер и на сервер</div>
+                </div>
+                <button class="btn-action" onclick="openCreateUserModal()">+ Создать пользователя</button>
+            </div>
+
+            <div style="overflow-x: auto;">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Логин</th>
+                            <th>Роль</th>
+                            <th>Статус</th>
+                            <th>Привязанный HWID</th>
+                            <th>Последний вход</th>
+                            <th>Действия</th>
+                        </tr>
+                    </thead>
+                    <tbody id="usersTbody">
+                        <tr><td colspan="6" style="text-align: center; color: var(--text-muted); padding: 30px;">Загрузка пользователей...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- TAB 2: ONLINE PLAYERS -->
+        <div id="onlineTab" class="card" style="display: none;">
+            <div class="card-header">
+                <div>
+                    <div class="card-title">Игроки с активным лаунчером в реальном времени</div>
+                    <div style="color: var(--text-muted); font-size: 13px; margin-top: 4px;">Пульс отправляется каждые 10 секунд</div>
+                </div>
+            </div>
+            <div style="overflow-x: auto;">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Статус</th>
+                            <th>Никнейм</th>
+                            <th>SteamID64</th>
+                            <th>HWID</th>
+                            <th>Пульс</th>
+                            <th>Действие</th>
+                        </tr>
+                    </thead>
+                    <tbody id="onlineTbody">
+                        <tr><td colspan="6" style="text-align: center; color: var(--text-muted); padding: 30px;">Загрузка...</td></tr>
+                    </tbody>
+                </table>
+            </div>
         </div>
     </div>
+
+    <!-- CREATE USER MODAL -->
+    <div id="createUserModal" class="modal-overlay" style="display: none;">
+        <div class="modal-card">
+            <h2>➕ Создать пользователя лаунчера</h2>
+            <div class="form-group">
+                <label>Логин (никнейм для входа)</label>
+                <input type="text" id="newUsername" class="form-control" placeholder="Например: alex_rust">
+            </div>
+            <div class="form-group">
+                <label>Пароль</label>
+                <input type="text" id="newPassword" class="form-control" placeholder="Например: rust12345">
+            </div>
+            <div class="form-group">
+                <label>Роль</label>
+                <select id="newRole" class="form-control">
+                    <option value="user">Игрок (User)</option>
+                    <option value="admin">Администратор (Admin)</option>
+                </select>
+            </div>
+            <div id="createError" style="color: var(--red-alert); font-size: 13px; display: none;"></div>
+            <div class="modal-btns">
+                <button class="btn-secondary" onclick="closeCreateUserModal()">Отмена</button>
+                <button class="btn-action" onclick="submitCreateUser()">Создать аккаунт</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- RESET PASSWORD MODAL -->
+    <div id="resetPassModal" class="modal-overlay" style="display: none;">
+        <div class="modal-card">
+            <h2>🔑 Смена пароля пользователя</h2>
+            <p style="color: var(--text-muted); font-size: 14px;">Пользователь: <strong id="resetTargetUser" style="color: #fff;"></strong></p>
+            <div class="form-group">
+                <label>Новый пароль</label>
+                <input type="text" id="resetNewPass" class="form-control" placeholder="Новый пароль">
+            </div>
+            <div id="resetError" style="color: var(--red-alert); font-size: 13px; display: none;"></div>
+            <div class="modal-btns">
+                <button class="btn-secondary" onclick="closeResetPassModal()">Отмена</button>
+                <button class="btn-action" onclick="submitResetPassword()">Сохранить пароль</button>
+            </div>
+        </div>
+    </div>
+
     <script>
-        async function fetchPlayers() {
+        let adminToken = localStorage.getItem('heavy_admin_token') || '';
+
+        function checkAuth() {
+            if (!adminToken) {
+                document.getElementById('loginScreen').style.display = 'flex';
+            } else {
+                document.getElementById('loginScreen').style.display = 'none';
+                loadUsers();
+                loadOnline();
+            }
+        }
+
+        async function loginAdmin() {
+            const u = document.getElementById('adminLoginUser').value.trim();
+            const p = document.getElementById('adminLoginPass').value.trim();
+            const err = document.getElementById('loginError');
+            err.style.display = 'none';
+
             try {
-                const res = await fetch('/api/players');
-                const players = await res.json();
-                const tbody = document.getElementById('playersTbody');
-                const active = players.filter(p => p.active);
-                document.getElementById('onlineCount').innerText = active.length;
-                document.getElementById('totalCount').innerText = players.length;
-                if (players.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; color: var(--text-muted); padding: 30px;">В данный момент никто не запустил лаунчер.</td></tr>';
+                const res = await fetch('/api/auth/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username: u, password: p })
+                });
+                const data = await res.json();
+                if (data.success && (data.role === 'owner' || data.role === 'admin')) {
+                    adminToken = data.token;
+                    localStorage.setItem('heavy_admin_token', adminToken);
+                    document.getElementById('currentAdminName').innerText = data.username;
+                    document.getElementById('loginScreen').style.display = 'none';
+                    loadUsers();
+                    loadOnline();
+                } else {
+                    err.innerText = data.message || 'Требуются права Овнера или Администратора!';
+                    err.style.display = 'block';
+                }
+            } catch (e) {
+                err.innerText = 'Ошибка соединения: ' + e;
+                err.style.display = 'block';
+            }
+        }
+
+        function logoutAdmin() {
+            localStorage.removeItem('heavy_admin_token');
+            adminToken = '';
+            location.reload();
+        }
+
+        function switchTab(tabId, btn) {
+            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            document.getElementById('usersTab').style.display = tabId === 'usersTab' ? 'flex' : 'none';
+            document.getElementById('onlineTab').style.display = tabId === 'onlineTab' ? 'flex' : 'none';
+        }
+
+        async function loadUsers() {
+            if (!adminToken) return;
+            try {
+                const res = await fetch('/api/admin/users', { headers: { 'Authorization': 'Bearer ' + adminToken } });
+                if (res.status === 401) { logoutAdmin(); return; }
+                const users = await res.json();
+                const tbody = document.getElementById('usersTbody');
+
+                if (users.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: var(--text-muted); padding: 30px;">Нет пользователей</td></tr>';
                     return;
                 }
-                tbody.innerHTML = players.map(p => \`
+
+                tbody.innerHTML = users.map(u => \`
                     <tr>
-                        <td><span class="badge \${p.active ? 'badge-active' : 'badge-offline'}"><span class="pulse-dot"></span> \${p.active ? 'В ИГРЕ' : 'ВЫШЕЛ'}</span></td>
-                        <td style="font-weight: 600;">\${escapeHtml(p.nickname)}</td>
-                        <td class="mono">\${p.steamId}</td>
-                        <td class="mono" style="font-size:11px; color:var(--text-muted);">\${p.hwid || 'N/A'}</td>
-                        <td>\${p.secondsAgo} сек.</td>
-                        <td><button class="btn-screen" onclick="requestScreen('\${p.steamId}')">📸 Скриншот</button></td>
+                        <td style="font-weight: 700; color: #fff;">\${escapeHtml(u.username)}</td>
+                        <td><span class="role-tag" style="\${u.role === 'owner' ? '' : 'background: rgba(0,229,255,0.1); color: var(--cyan-neon); border-color: rgba(0,229,255,0.3);'}">\${u.role.toUpperCase()}</span></td>
+                        <td><span class="badge \${u.active ? 'badge-active' : 'badge-blocked'}"><span class="pulse-dot"></span> \${u.active ? 'АКТИВЕН' : 'ЗАБЛОКИРОВАН'}</span></td>
+                        <td>
+                            <span class="mono" style="font-size: 11px; color: var(--text-muted);">\${u.hwid ? u.hwid : 'Не привязан'}</span>
+                            \${u.hwid ? \`<button class="btn-secondary" style="margin-left: 6px; padding: 2px 6px; font-size: 11px;" onclick="resetHwid('\${escapeHtml(u.username)}')">Сброс HWID</button>\` : ''}
+                        </td>
+                        <td style="font-size: 12px; color: var(--text-muted);">\${u.lastLogin ? new Date(u.lastLogin).toLocaleString('ru-RU') : 'Ещё не входил'}</td>
+                        <td>
+                            <div style="display: flex; gap: 6px;">
+                                \${u.username !== 'owner' ? \`
+                                    <button class="btn-secondary" onclick="toggleUser('\${escapeHtml(u.username)}')">\${u.active ? 'Заблокировать' : 'Разблокировать'}</button>
+                                    <button class="btn-secondary" onclick="openResetPassModal('\${escapeHtml(u.username)}')">Пароль</button>
+                                    <button class="btn-danger" onclick="deleteUser('\${escapeHtml(u.username)}')">Удалить</button>
+                                \` : '<span style="color: var(--gold); font-size: 12px; font-weight: 600;">Главный Овнер</span>'}
+                            </div>
+                        </td>
                     </tr>
                 \`).join('');
             } catch (e) { console.error(e); }
         }
-        async function requestScreen(steamId) {
+
+        async function loadOnline() {
             try {
-                await fetch('/api/screen_request', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ target: steamId }) });
-                alert('Запрос скриншота для ' + steamId + ' отправлен! Снимок поступит в Discord.');
+                const res = await fetch('/api/players');
+                const players = await res.json();
+                const tbody = document.getElementById('onlineTbody');
+
+                if (players.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: var(--text-muted); padding: 30px;">В данный момент никто не запустил лаунчер.</td></tr>';
+                    return;
+                }
+
+                tbody.innerHTML = players.map(p => \`
+                    <tr>
+                        <td><span class="badge \${p.active ? 'badge-active' : 'badge-blocked'}"><span class="pulse-dot"></span> \${p.active ? 'В ИГРЕ' : 'ВЫШЕЛ'}</span></td>
+                        <td style="font-weight: 600;">\${escapeHtml(p.nickname)}</td>
+                        <td class="mono">\${p.steamId}</td>
+                        <td class="mono" style="font-size:11px; color:var(--text-muted);">\${p.hwid || 'N/A'}</td>
+                        <td>\${p.secondsAgo} сек.</td>
+                        <td><button class="btn-action" style="padding: 5px 12px; font-size: 12px;" onclick="requestScreen('\${p.steamId}')">📸 Скриншот</button></td>
+                    </tr>
+                \`).join('');
+            } catch (e) { console.error(e); }
+        }
+
+        function openCreateUserModal() {
+            document.getElementById('newUsername').value = '';
+            document.getElementById('newPassword').value = '';
+            document.getElementById('createError').style.display = 'none';
+            document.getElementById('createUserModal').style.display = 'flex';
+        }
+        function closeCreateUserModal() { document.getElementById('createUserModal').style.display = 'none'; }
+
+        async function submitCreateUser() {
+            const u = document.getElementById('newUsername').value.trim();
+            const p = document.getElementById('newPassword').value.trim();
+            const r = document.getElementById('newRole').value;
+            const err = document.getElementById('createError');
+
+            try {
+                const res = await fetch('/api/admin/users/create', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + adminToken },
+                    body: JSON.stringify({ username: u, password: p, role: r })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    closeCreateUserModal();
+                    loadUsers();
+                } else {
+                    err.innerText = data.message;
+                    err.style.display = 'block';
+                }
+            } catch (e) {
+                err.innerText = 'Ошибка: ' + e;
+                err.style.display = 'block';
+            }
+        }
+
+        async function toggleUser(username) {
+            try {
+                await fetch('/api/admin/users/toggle', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + adminToken },
+                    body: JSON.stringify({ username })
+                });
+                loadUsers();
             } catch (e) { alert('Ошибка: ' + e); }
         }
+
+        async function resetHwid(username) {
+            if (!confirm('Сбросить привязку HWID для ' + username + '?')) return;
+            try {
+                await fetch('/api/admin/users/reset_hwid', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + adminToken },
+                    body: JSON.stringify({ username })
+                });
+                alert('HWID успешно сброшен!');
+                loadUsers();
+            } catch (e) { alert('Ошибка: ' + e); }
+        }
+
+        let targetResetUser = '';
+        function openResetPassModal(username) {
+            targetResetUser = username;
+            document.getElementById('resetTargetUser').innerText = username;
+            document.getElementById('resetNewPass').value = '';
+            document.getElementById('resetError').style.display = 'none';
+            document.getElementById('resetPassModal').style.display = 'flex';
+        }
+        function closeResetPassModal() { document.getElementById('resetPassModal').style.display = 'none'; }
+
+        async function submitResetPassword() {
+            const p = document.getElementById('resetNewPass').value.trim();
+            const err = document.getElementById('resetError');
+            try {
+                const res = await fetch('/api/admin/users/reset_password', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + adminToken },
+                    body: JSON.stringify({ username: targetResetUser, newPassword: p })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    alert('Пароль успешно обновлён!');
+                    closeResetPassModal();
+                } else {
+                    err.innerText = data.message;
+                    err.style.display = 'block';
+                }
+            } catch (e) { err.innerText = 'Ошибка: ' + e; err.style.display = 'block'; }
+        }
+
+        async function deleteUser(username) {
+            if (!confirm('Вы уверены, что хотите НАВСЕГДА удалить пользователя ' + username + '?')) return;
+            try {
+                await fetch('/api/admin/users/delete', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + adminToken },
+                    body: JSON.stringify({ username })
+                });
+                loadUsers();
+            } catch (e) { alert('Ошибка: ' + e); }
+        }
+
+        async function requestScreen(steamId) {
+            try {
+                await fetch('/api/screen_request', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ target: steamId })
+                });
+                alert('Запрос скрытого снимка экрана для ' + steamId + ' отправлен! Результат поступит в Discord.');
+            } catch (e) { alert('Ошибка: ' + e); }
+        }
+
         function escapeHtml(t) { return (t || '').replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
-        fetchPlayers();
-        setInterval(fetchPlayers, 3000);
+
+        checkAuth();
+        setInterval(loadOnline, 4000);
     </script>
 </body>
 </html>`);
