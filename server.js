@@ -395,14 +395,15 @@ app.post('/api/heartbeat', (req, res) => {
     res.json({ status: 'ok', valid: true, request_screen: screenRequested });
 });
 
-// Check player by steamid
+// Check player by steamid or nickname
 app.get('/api/check', (req, res) => {
     const steamId = String(req.query.steamid || '').trim();
-    const session = sessions.get(steamId);
+    const nickname = String(req.query.nickname || req.query.name || '').trim();
+    const session = findActiveSession(steamId, nickname);
 
     if (session && (Date.now() - session.lastHeartbeat) <= 35000) {
         const secondsAgo = Math.round((Date.now() - session.lastHeartbeat) / 1000);
-        res.json({ steamId, valid: true, nickname: session.nickname, hwid: session.hwid, secondsAgo });
+        res.json({ steamId: session.steamId, valid: true, nickname: session.nickname, hwid: session.hwid, secondsAgo });
     } else {
         res.json({ steamId, valid: false, message: 'No active launcher session found' });
     }
