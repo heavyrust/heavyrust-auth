@@ -1,0 +1,16 @@
+{
+  "name": "heavyrust-auth-server",
+  "version": "1.0.0",
+  "description": "Master Auth Server for Heavy Rust Launcher & AntiCheat",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}
